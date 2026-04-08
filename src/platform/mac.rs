@@ -9,6 +9,7 @@ mod display_link;
 mod events;
 mod keyboard;
 mod pasteboard;
+mod tray;
 
 #[cfg(feature = "screen-capture")]
 mod screen_capture;
@@ -44,6 +45,7 @@ pub(crate) use display::*;
 pub(crate) use display_link::*;
 pub(crate) use keyboard::*;
 pub(crate) use platform::*;
+pub(crate) use tray::*;
 pub(crate) use window::*;
 
 #[cfg(feature = "font-kit")]

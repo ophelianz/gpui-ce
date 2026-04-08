@@ -41,15 +41,16 @@ pub use visual_test_context::*;
 #[cfg(any(feature = "inspector", debug_assertions))]
 use crate::InspectorElementRegistry;
 use crate::{
-    Action, ActionBuildError, ActionRegistry, Any, AnyView, AnyWindowHandle, AppContext, Arena,
-    ArenaBox, Asset, AssetSource, BackgroundExecutor, Bounds, ClipboardItem, CursorStyle,
-    DispatchPhase, DisplayId, EventEmitter, FocusHandle, FocusMap, ForegroundExecutor, Global,
-    KeyBinding, KeyContext, Keymap, Keystroke, LayoutId, Menu, MenuItem, OwnedMenu,
-    PathPromptOptions, Pixels, Platform, PlatformDisplay, PlatformKeyboardLayout,
-    PlatformKeyboardMapper, Point, Priority, PromptBuilder, PromptButton, PromptHandle,
-    PromptLevel, Render, RenderImage, RenderablePromptHandle, Reservation, ScreenCaptureSource,
-    SharedString, SubscriberSet, Subscription, SvgRenderer, Task, TextRenderingMode, TextSystem,
-    ThermalState, Window, WindowAppearance, WindowHandle, WindowId, WindowInvalidator,
+    Action, ActionBuildError, ActionRegistry, Any, AnyView, AnyWindowHandle, AppContext,
+    ApplicationActivationPolicy, Arena, ArenaBox, Asset, AssetSource, BackgroundExecutor, Bounds,
+    ClipboardItem, CursorStyle, DispatchPhase, DisplayId, EventEmitter, FocusHandle, FocusMap,
+    ForegroundExecutor, Global, KeyBinding, KeyContext, Keymap, Keystroke, LayoutId, Menu,
+    MenuItem, OwnedMenu, PathPromptOptions, Pixels, Platform, PlatformDisplay,
+    PlatformKeyboardLayout, PlatformKeyboardMapper, Point, Priority, PromptBuilder, PromptButton,
+    PromptHandle, PromptLevel, Render, RenderImage, RenderablePromptHandle, Reservation,
+    ScreenCaptureSource, SharedString, SubscriberSet, Subscription, SvgRenderer, Task,
+    TextRenderingMode, TextSystem, ThermalState, Tray, TrayIntent, Window, WindowAppearance,
+    WindowHandle, WindowId, WindowInvalidator,
     colors::{Colors, GlobalColors},
     hash, init_app_menus,
 };
@@ -177,6 +178,12 @@ impl Application {
     /// By default, [`QuitMode::Default`] is used.
     pub fn with_quit_mode(self, mode: QuitMode) -> Self {
         self.0.borrow_mut().quit_mode = mode;
+        self
+    }
+
+    /// Configures how the application integrates with the host shell.
+    pub fn with_activation_policy(self, policy: ApplicationActivationPolicy) -> Self {
+        self.0.borrow().platform.set_activation_policy(policy);
         self
     }
 
@@ -1109,6 +1116,11 @@ impl App {
     /// Instructs the platform to activate the application by bringing it to the foreground.
     pub fn activate(&self, ignoring_other_apps: bool) {
         self.platform.activate(ignoring_other_apps);
+    }
+
+    /// Updates how the running application integrates with the host shell.
+    pub fn set_activation_policy(&self, policy: ApplicationActivationPolicy) {
+        self.platform.set_activation_policy(policy);
     }
 
     /// Hide the application at the platform level.
@@ -2090,6 +2102,20 @@ impl App {
     /// Sets the right click menu for the app icon in the dock
     pub fn set_dock_menu(&self, menus: Vec<MenuItem>) {
         self.platform.set_dock_menu(menus, &self.keymap.borrow())
+    }
+
+    /// Sets the system tray or menu-bar item for the application.
+    pub fn set_tray(&mut self, mut tray: Tray) {
+        if let Err(err) = tray.render_icon(self.svg_renderer.clone()) {
+            log::warn!("Ignored invalid tray icon: {err}");
+        }
+
+        self.platform.set_tray(tray)
+    }
+
+    /// Drains any tray intents queued by the platform since the last poll.
+    pub fn take_tray_intents(&self) -> Vec<TrayIntent> {
+        self.platform.take_tray_intents()
     }
 
     /// Performs the action associated with the given dock menu item, only used on Windows for now.

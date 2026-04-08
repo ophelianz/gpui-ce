@@ -4,8 +4,8 @@
 #![allow(clippy::collapsible_else_if)] // False positives in platform specific code
 #![allow(unused_mut)] // False positives in platform specific code
 
-extern crate self as gpui;
 extern crate gpui_ce_macros as gpui_macros;
+extern crate self as gpui;
 
 #[macro_use]
 mod action;
@@ -53,6 +53,7 @@ mod taffy;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test;
 mod text_system;
+mod tray;
 mod view;
 mod window;
 
@@ -122,6 +123,7 @@ pub use taffy::{AvailableSpace, LayoutId};
 #[cfg(any(test, feature = "test-support"))]
 pub use test::*;
 pub use text_system::*;
+pub use tray::*;
 pub use util::arc_cow::ArcCow;
 pub use view::*;
 pub use window::*;

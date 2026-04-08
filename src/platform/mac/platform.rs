@@ -1,5 +1,5 @@
 use super::{
-    BoolExt, MacDispatcher, MacDisplay, MacKeyboardLayout, MacKeyboardMapper, MacWindow,
+    BoolExt, MacDispatcher, MacDisplay, MacKeyboardLayout, MacKeyboardMapper, MacTray, MacWindow,
     events::key_to_native, ns_string, pasteboard::Pasteboard, renderer,
 };
 use crate::command::{new_command, new_std_command};
@@ -7,7 +7,10 @@ use anyhow::{Context as _, anyhow};
 use block::ConcreteBlock;
 use cocoa::{
     appkit::{
-        NSApplication, NSApplicationActivationPolicy::NSApplicationActivationPolicyRegular,
+        NSApplication,
+        NSApplicationActivationPolicy::{
+            NSApplicationActivationPolicyAccessory, NSApplicationActivationPolicyRegular,
+        },
         NSControl as _, NSEventModifierFlags, NSMenu, NSMenuItem, NSModalResponse, NSOpenPanel,
         NSSavePanel, NSVisualEffectState, NSVisualEffectView, NSWindow,
     },
@@ -28,10 +31,11 @@ use ctor::ctor;
 use dispatch2::DispatchQueue;
 use futures::channel::oneshot;
 use gpui::{
-    Action, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, ForegroundExecutor,
-    KeyContext, Keymap, Menu, MenuItem, OsMenu, OwnedMenu, PathPromptOptions, Platform,
-    PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
-    PlatformWindow, Result, SystemMenuType, Task, ThermalState, WindowAppearance, WindowParams,
+    Action, AnyWindowHandle, ApplicationActivationPolicy, BackgroundExecutor, ClipboardItem,
+    CursorStyle, ForegroundExecutor, KeyContext, Keymap, Menu, MenuItem, OsMenu, OwnedMenu,
+    PathPromptOptions, Platform, PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper,
+    PlatformTextSystem, PlatformWindow, Result, SystemMenuType, Task, ThermalState, Tray,
+    TrayIntent, TrayMenuItem, WindowAppearance, WindowParams,
 };
 use itertools::Itertools;
 use objc::{
@@ -46,6 +50,7 @@ use ptr::null_mut;
 use semver::Version;
 use std::{
     cell::Cell,
+    collections::VecDeque,
     ffi::{CStr, OsStr, c_void},
     os::{raw::c_char, unix::ffi::OsStrExt},
     path::{Path, PathBuf},
@@ -95,6 +100,10 @@ unsafe fn build_classes() {
             decl.add_method(
                 sel!(handleGPUIMenuItem:),
                 handle_menu_item as extern "C" fn(&mut Object, Sel, id),
+            );
+            decl.add_method(
+                sel!(handleGPUITrayMenuItem:),
+                handle_tray_menu_item as extern "C" fn(&mut Object, Sel, id),
             );
             // Add menu item handlers so that OS save panels have the correct key commands
             decl.add_method(
@@ -176,6 +185,11 @@ pub(crate) struct MacPlatformState {
     finish_launching: Option<Box<dyn FnOnce()>>,
     dock_menu: Option<id>,
     menus: Option<Vec<OwnedMenu>>,
+    tray: Option<MacTray>,
+    tray_menu: Option<id>,
+    tray_menu_intents: Vec<TrayIntent>,
+    pending_tray_intents: VecDeque<TrayIntent>,
+    activation_policy: ApplicationActivationPolicy,
     keyboard_mapper: Rc<MacKeyboardMapper>,
 }
 
@@ -210,9 +224,14 @@ impl MacPlatform {
             open_urls: None,
             finish_launching: None,
             dock_menu: None,
+            tray: None,
+            tray_menu: None,
+            tray_menu_intents: Default::default(),
+            pending_tray_intents: Default::default(),
             on_keyboard_layout_change: None,
             on_thermal_state_change: None,
             menus: None,
+            activation_policy: ApplicationActivationPolicy::Regular,
             keyboard_mapper,
         }))
     }
@@ -240,6 +259,7 @@ impl MacPlatform {
                         delegate,
                         actions,
                         keymap,
+                        true,
                     ));
                 }
 
@@ -258,26 +278,60 @@ impl MacPlatform {
         }
     }
 
-    unsafe fn create_dock_menu(
-        &self,
+    unsafe fn create_menu(
         menu_items: Vec<MenuItem>,
         delegate: id,
         actions: &mut Vec<Box<dyn Action>>,
         keymap: &Keymap,
+        include_key_equivalents: bool,
     ) -> id {
         unsafe {
-            let dock_menu = NSMenu::new(nil);
-            dock_menu.setDelegate_(delegate);
+            let menu = NSMenu::new(nil);
+            menu.setDelegate_(delegate);
             for item_config in menu_items {
-                dock_menu.addItem_(Self::create_menu_item(
+                menu.addItem_(Self::create_menu_item(
                     &item_config,
                     delegate,
                     actions,
                     keymap,
+                    include_key_equivalents,
                 ));
             }
 
-            dock_menu
+            menu
+        }
+    }
+
+    unsafe fn create_tray_menu(menu_items: &[TrayMenuItem], delegate: id) -> (id, Vec<TrayIntent>) {
+        unsafe {
+            let menu = NSMenu::new(nil);
+            menu.setDelegate_(delegate);
+            let mut intents = Vec::new();
+            for item in menu_items {
+                menu.addItem_(Self::create_tray_menu_item(item, &mut intents));
+            }
+            (menu, intents)
+        }
+    }
+
+    unsafe fn create_tray_menu_item(item: &TrayMenuItem, intents: &mut Vec<TrayIntent>) -> id {
+        unsafe {
+            match item {
+                TrayMenuItem::Separator => NSMenuItem::separatorItem(nil),
+                TrayMenuItem::Action { name, intent } => {
+                    let item = NSMenuItem::alloc(nil)
+                        .initWithTitle_action_keyEquivalent_(
+                            ns_string(name),
+                            selector("handleGPUITrayMenuItem:"),
+                            ns_string(""),
+                        )
+                        .autorelease();
+                    let tag = intents.len() as NSInteger;
+                    let _: () = msg_send![item, setTag: tag];
+                    intents.push(intent.clone());
+                    item
+                }
+            }
         }
     }
 
@@ -286,6 +340,7 @@ impl MacPlatform {
         delegate: id,
         actions: &mut Vec<Box<dyn Action>>,
         keymap: &Keymap,
+        include_key_equivalents: bool,
     ) -> id {
         static DEFAULT_CONTEXT: OnceLock<Vec<KeyContext>> = OnceLock::new();
 
@@ -302,25 +357,31 @@ impl MacPlatform {
                     // Note that this is intentionally using earlier bindings, whereas typically
                     // later ones take display precedence. See the discussion on
                     // https://github.com/zed-industries/zed/issues/23621
-                    let keystrokes = keymap
-                        .bindings_for_action(action.as_ref())
-                        .find_or_first(|binding| {
-                            binding.predicate().is_none_or(|predicate| {
-                                predicate.eval(DEFAULT_CONTEXT.get_or_init(|| {
-                                    let mut workspace_context = KeyContext::new_with_defaults();
-                                    workspace_context.add("Workspace");
-                                    let mut pane_context = KeyContext::new_with_defaults();
-                                    pane_context.add("Pane");
-                                    let mut editor_context = KeyContext::new_with_defaults();
-                                    editor_context.add("Editor");
+                    let keystrokes = include_key_equivalents
+                        .then(|| {
+                            keymap
+                                .bindings_for_action(action.as_ref())
+                                .find_or_first(|binding| {
+                                    binding.predicate().is_none_or(|predicate| {
+                                        predicate.eval(DEFAULT_CONTEXT.get_or_init(|| {
+                                            let mut workspace_context =
+                                                KeyContext::new_with_defaults();
+                                            workspace_context.add("Workspace");
+                                            let mut pane_context = KeyContext::new_with_defaults();
+                                            pane_context.add("Pane");
+                                            let mut editor_context =
+                                                KeyContext::new_with_defaults();
+                                            editor_context.add("Editor");
 
-                                    pane_context.extend(&editor_context);
-                                    workspace_context.extend(&pane_context);
-                                    vec![workspace_context]
-                                }))
-                            })
+                                            pane_context.extend(&editor_context);
+                                            workspace_context.extend(&pane_context);
+                                            vec![workspace_context]
+                                        }))
+                                    })
+                                })
+                                .map(|binding| binding.keystrokes())
                         })
-                        .map(|binding| binding.keystrokes());
+                        .flatten();
 
                     let selector = match os_action {
                         Some(gpui::OsAction::Cut) => selector("cut:"),
@@ -411,7 +472,13 @@ impl MacPlatform {
                     let submenu = NSMenu::new(nil).autorelease();
                     submenu.setDelegate_(delegate);
                     for item in items {
-                        submenu.addItem_(Self::create_menu_item(item, delegate, actions, keymap));
+                        submenu.addItem_(Self::create_menu_item(
+                            item,
+                            delegate,
+                            actions,
+                            keymap,
+                            include_key_equivalents,
+                        ));
                     }
                     item.setSubmenu_(submenu);
                     item.setEnabled_(if *disabled { NO } else { YES });
@@ -945,10 +1012,54 @@ impl Platform for MacPlatform {
             let app: id = msg_send![APP_CLASS, sharedApplication];
             let mut state = self.0.lock();
             let actions = &mut state.menu_actions;
-            let new = self.create_dock_menu(menu, NSWindow::delegate(app), actions, keymap);
+            let new = Self::create_menu(menu, NSWindow::delegate(app), actions, keymap, true);
             if let Some(old) = state.dock_menu.replace(new) {
                 CFRelease(old as _)
             }
+        }
+    }
+
+    fn set_tray(&self, tray: Tray) {
+        let mut state = self.0.lock();
+
+        unsafe {
+            if tray.menu_items.is_empty() {
+                if let Some(old) = state.tray_menu.take() {
+                    CFRelease(old as _);
+                }
+                state.tray_menu_intents.clear();
+            } else {
+                let app: id = msg_send![APP_CLASS, sharedApplication];
+                let (new, intents) =
+                    Self::create_tray_menu(&tray.menu_items, NSWindow::delegate(app));
+                if let Some(old) = state.tray_menu.replace(new) {
+                    CFRelease(old as _);
+                }
+                state.tray_menu_intents = intents;
+            }
+        }
+
+        let tray_menu = state.tray_menu;
+        if let Some(mac_tray) = &mut state.tray {
+            mac_tray.update(&tray, tray_menu);
+        } else {
+            state.tray = Some(MacTray::create(&tray, tray_menu));
+        }
+    }
+
+    fn take_tray_intents(&self) -> Vec<TrayIntent> {
+        self.0.lock().pending_tray_intents.drain(..).collect()
+    }
+
+    fn set_activation_policy(&self, policy: ApplicationActivationPolicy) {
+        self.0.lock().activation_policy = policy;
+        unsafe {
+            let app: id = msg_send![APP_CLASS, sharedApplication];
+            let objc_policy = match policy {
+                ApplicationActivationPolicy::Regular => NSApplicationActivationPolicyRegular,
+                ApplicationActivationPolicy::Accessory => NSApplicationActivationPolicyAccessory,
+            };
+            app.setActivationPolicy_(objc_policy);
         }
     }
 
@@ -1198,7 +1309,12 @@ extern "C" fn will_finish_launching(_this: &mut Object, _: Sel, _: id) {
 extern "C" fn did_finish_launching(this: &mut Object, _: Sel, _: id) {
     unsafe {
         let app: id = msg_send![APP_CLASS, sharedApplication];
-        app.setActivationPolicy_(NSApplicationActivationPolicyRegular);
+        let activation_policy = get_mac_platform(this).0.lock().activation_policy;
+        let objc_policy = match activation_policy {
+            ApplicationActivationPolicy::Regular => NSApplicationActivationPolicyRegular,
+            ApplicationActivationPolicy::Accessory => NSApplicationActivationPolicyAccessory,
+        };
+        app.setActivationPolicy_(objc_policy);
 
         let notification_center: *mut Object =
             msg_send![class!(NSNotificationCenter), defaultCenter];
@@ -1217,8 +1333,7 @@ extern "C" fn did_finish_launching(this: &mut Object, _: Sel, _: id) {
             object: process_info
         ];
 
-        let platform = get_mac_platform(this);
-        let callback = platform.0.lock().finish_launching.take();
+        let callback = get_mac_platform(this).0.lock().finish_launching.take();
         if let Some(callback) = callback {
             callback();
         }
@@ -1329,8 +1444,25 @@ extern "C" fn handle_menu_item(this: &mut Object, _: Sel, item: id) {
     }
 }
 
+extern "C" fn handle_tray_menu_item(this: &mut Object, _: Sel, item: id) {
+    unsafe {
+        let platform = get_mac_platform(this);
+        let mut lock = platform.0.lock();
+        let tag: NSInteger = msg_send![item, tag];
+        let index = tag as usize;
+        if let Some(intent) = lock.tray_menu_intents.get(index).cloned() {
+            lock.pending_tray_intents.push_back(intent);
+        }
+    }
+}
+
 extern "C" fn validate_menu_item(this: &mut Object, _: Sel, item: id) -> bool {
     unsafe {
+        let action: Sel = msg_send![item, action];
+        if action == selector("handleGPUITrayMenuItem:") {
+            return true;
+        }
+
         let mut result = false;
         let platform = get_mac_platform(this);
         let mut lock = platform.0.lock();

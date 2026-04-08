@@ -51,7 +51,7 @@ use crate::{
     ForegroundExecutor, GlyphId, GpuSpecs, ImageSource, Keymap, LineLayout, Pixels, PlatformInput,
     Point, Priority, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Scene,
     ShapedGlyph, ShapedRun, SharedString, Size, SvgRenderer, SystemWindowTab, Task,
-    ThreadTaskTimings, Window, WindowControlArea, hash, point, px, size,
+    ThreadTaskTimings, Tray, TrayIntent, Window, WindowControlArea, hash, point, px, size,
 };
 use anyhow::Result;
 use async_task::Runnable;
@@ -128,6 +128,16 @@ pub fn current_platform(headless: bool) -> Rc<dyn Platform> {
 /// Returns a background executor for the current platform.
 pub fn background_executor() -> crate::BackgroundExecutor {
     current_platform(true).background_executor()
+}
+
+/// Controls how the application integrates with the host desktop shell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ApplicationActivationPolicy {
+    /// Show the application as a regular app with normal dock/taskbar presence.
+    #[default]
+    Regular,
+    /// Run as an accessory app without a dock icon on macOS.
+    Accessory,
 }
 
 /// Creates a new application with the current platform.
@@ -265,6 +275,7 @@ pub trait Platform: 'static {
 
     fn on_quit(&self, callback: Box<dyn FnMut()>);
     fn on_reopen(&self, callback: Box<dyn FnMut()>);
+    fn set_activation_policy(&self, _policy: ApplicationActivationPolicy) {}
 
     fn set_menus(&self, menus: Vec<Menu>, keymap: &Keymap);
     fn get_menus(&self) -> Option<Vec<OwnedMenu>> {
@@ -272,6 +283,10 @@ pub trait Platform: 'static {
     }
 
     fn set_dock_menu(&self, menu: Vec<MenuItem>, keymap: &Keymap);
+    fn set_tray(&self, _tray: Tray) {}
+    fn take_tray_intents(&self) -> Vec<TrayIntent> {
+        Vec::new()
+    }
     fn perform_dock_menu_action(&self, _action: usize) {}
     fn add_recent_document(&self, _path: &Path) {}
     fn update_jump_list(
